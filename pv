@@ -1,0 +1,527 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import { 
+  PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, 
+  BarChart, Bar, XAxis, YAxis, CartesianGrid 
+} from 'recharts';
+import { 
+  Search, Database, Info, Calendar, Link as LinkIcon, XCircle, 
+  Workflow, LayoutDashboard, Check, Truck, Lock, AlertCircle, 
+  FilterX, ChevronRight, FileCheck, Layers, ClipboardList, AlertOctagon,
+  ArrowRight, Activity, Zap
+} from 'lucide-react';
+
+const App = () => {
+  const [data, setData] = useState({ pen: [], pv: [] });
+  const [filesLoaded, setFilesLoaded] = useState([]);
+  const [libReady, setLibReady] = useState(false);
+  const [activeProject, setActiveProject] = useState(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [filterType, setFilterType] = useState(null); // 'final', 'correlative', 'locked', 'broken'
+  const [currentTab, setCurrentTab] = useState('dashboard'); // 'dashboard' or 'audit'
+
+  const COLORS = {
+    final: '#059669',      // Verde Esmeralda (Sincro Final)
+    correlative: '#A7F3D0', // Verde Clarito (Eslabón Correlativo)
+    locked: '#F59E0B',     // Ámbar (Bloqueado > 10 días)
+    broken: '#EF4444',      // Rojo (Roto / Cruz)
+    slate: '#64748B',
+    zitro: '#E11D48'
+  };
+
+  // Carga dinámica de SheetJS
+  useEffect(() => {
+    if (window.XLSX) {
+      setLibReady(true);
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
+    script.async = true;
+    script.onload = () => setLibReady(true);
+    document.head.appendChild(script);
+  }, []);
+
+  const handleFileUpload = (e) => {
+    if (!libReady) return;
+    const files = Array.from(e.target.files);
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        const bstr = evt.target.result;
+        const XLSX = window.XLSX;
+        const wb = XLSX.read(bstr, { type: 'binary', cellDates: true });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const jsonData = XLSX.utils.sheet_to_json(ws, { defval: "" });
+        
+        const keys = Object.keys(jsonData[0] || {});
+        const normalizedKeys = keys.map(k => k.toLowerCase());
+
+        if (normalizedKeys.some(k => k.includes('capaz') || k.includes('codigo proyecto') || k.includes('código proyecto'))) {
+          setData(prev => ({ ...prev, pen: jsonData }));
+          setFilesLoaded(prev => [...new Set([...prev, "Ensamblados"])]);
+        } else if (normalizedKeys.some(k => k.includes('venta a-nombre') || k.includes('fecha envío'))) {
+          setData(prev => ({ ...prev, pv: jsonData }));
+          setFilesLoaded(prev => [...new Set([...prev, "Ventas"])]);
+        }
+      };
+      reader.readAsBinaryString(file);
+    });
+  };
+
+  // MOTOR DE CÁLCULO DE PROYECTOS VINCULADOS
+  const projects = useMemo(() => {
+    if (data.pen.length === 0 || data.pv.length === 0) return {};
+
+    const linked = {};
+    const pvMap = new Map();
+    
+    // 1. Mapeo de Ventas
+    data.pv.forEach(v => {
+      const id = String(v['Código Proyecto'] || v['Codigo Proyecto'] || v['Nº'] || "").trim().toUpperCase();
+      if (id) pvMap.set(id, v);
+    });
+
+    // 2. Agrupación de Ensamblados vinculados
+    data.pen.forEach(pen => {
+      const pCode = String(pen['Código proyecto'] || pen['Codigo proyecto'] || pen['Ensamblar para pedido'] || "").trim().toUpperCase();
+      
+      if (pvMap.has(pCode)) {
+        if (!linked[pCode]) {
+          const venta = pvMap.get(pCode);
+          linked[pCode] = { 
+            id: pCode, 
+            client: venta['Venta a-Nombre'],
+            shipDate: venta['Fecha envío'] ? new Date(venta['Fecha envío']) : null,
+            items: [],
+            stats: { final: 0, correlative: 0, broken: 0, locked: 0 }
+          };
+        }
+        linked[pCode].items.push({
+          id: pen['Nº'],
+          desc: pen['Descripción'] || pen['Nº producto'],
+          start: pen['Fecha inicial'] ? new Date(pen['Fecha inicial']) : null,
+          end: pen['Fecha vencimiento'] ? new Date(pen['Fecha vencimiento']) : null
+        });
+      }
+    });
+
+    // 3. Auditoría de Secuencia y Regla de 10 días
+    Object.values(linked).forEach(proj => {
+      const shipDate = proj.shipDate;
+      if (!shipDate) return;
+
+      proj.items.forEach(item => {
+        if (!item.end) {
+          item.status = 'broken';
+          proj.stats.broken++;
+          return;
+        }
+
+        // diffDays: Positivo si el vencimiento es posterior al envío (Mal)
+        // Negativo si el vencimiento es anterior al envío (Bien/Bloqueo)
+        const diffTime = item.end.getTime() - shipDate.getTime();
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+        // CASO BLOQUEO: Envío es 10 días o más ANTERIOR al vencimiento del ensamblado
+        // Es decir, diffDays >= 10 (Vencimiento 10+ días después del envío)
+        if (diffDays >= 10) {
+          item.status = 'locked';
+          proj.stats.locked++;
+        } 
+        // CASO SINCRO FINAL: El ensamblado termina exactamente el día del envío
+        else if (item.end.toDateString() === shipDate.toDateString()) {
+          item.status = 'final';
+          proj.stats.final++;
+        }
+        // CASO CORRELATIVO: El vencimiento de este PEN coincide con el inicio de otro PEN del proyecto
+        else {
+          const isCorrelative = proj.items.some(other => 
+            other.id !== item.id && 
+            other.start && 
+            other.start.toDateString() === item.end.toDateString()
+          );
+
+          if (isCorrelative) {
+            item.status = 'correlative';
+            proj.stats.correlative++;
+          } else {
+            item.status = 'broken';
+            proj.stats.broken++;
+          }
+        }
+      });
+    });
+
+    return linked;
+  }, [data]);
+
+  const projectList = Object.values(projects).sort((a,b) => a.id.localeCompare(b.id));
+
+  // Datos para Dashboard
+  const chartData = useMemo(() => {
+    const counts = { final: 0, correlative: 0, locked: 0, broken: 0 };
+    projectList.forEach(p => {
+        counts.final += p.stats.final;
+        counts.correlative += p.stats.correlative;
+        counts.locked += p.stats.locked;
+        counts.broken += p.stats.broken;
+    });
+    return [
+      { id: 'final', name: 'Sincro Final', value: counts.final, fill: COLORS.final, desc: 'Vencimiento = Envío' },
+      { id: 'correlative', name: 'Correlativos', value: counts.correlative, fill: COLORS.sequenceOk, desc: 'Vencimiento = Inicio Sig.' },
+      { id: 'locked', name: 'Bloqueados (>10d)', value: counts.locked, fill: COLORS.blocked, desc: 'Envío >10d anterior' },
+      { id: 'broken', name: 'Rotos / Cruz', value: counts.broken, fill: COLORS.broken, desc: 'Sin conexión lógica' }
+    ];
+  }, [projectList]);
+
+  // Filtrado de Sidebar
+  const filteredProjects = useMemo(() => {
+    return projectList.filter(p => {
+      const matchesSearch = p.id.toLowerCase().includes(searchTerm.toLowerCase());
+      if (!filterType) return matchesSearch;
+      return matchesSearch && p.items.some(item => item.status === filterType);
+    });
+  }, [projectList, searchTerm, filterType]);
+
+  const handleChartClick = (state) => {
+    if (state && state.activePayload) {
+      const clickedId = state.activePayload[0].payload.id;
+      setFilterType(prev => prev === clickedId ? null : clickedId);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-[#fcfcfc] overflow-hidden font-sans text-slate-900">
+      
+      {/* Header Premium */}
+      <header className="bg-slate-950 text-white h-20 px-8 flex justify-between items-center shrink-0 z-50 shadow-2xl">
+        <div className="flex items-center gap-6">
+          <div className="bg-[#e11d48] text-white w-12 h-12 rounded-2xl flex items-center justify-center font-black text-2xl italic shadow-lg shadow-rose-900/20">Z</div>
+          <div>
+            <h1 className="text-xl font-black tracking-tight leading-none uppercase italic">Sequence <span className="text-[#e11d48]">Hub Pro</span></h1>
+            <p className="text-[9px] uppercase tracking-[0.4em] text-slate-500 font-black mt-1">Zitro Production Auditor</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-4">
+           {/* Tab Navigation */}
+           <div className="flex bg-slate-900 p-1.5 rounded-2xl border border-slate-800 mr-4">
+              <button 
+                onClick={() => setCurrentTab('dashboard')} 
+                className={`px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${currentTab === 'dashboard' ? 'bg-[#e11d48] text-white shadow-lg' : 'text-slate-500 hover:text-white'}`}
+              >
+                <LayoutDashboard size={14} /> Dashboard
+              </button>
+              <button 
+                onClick={() => setCurrentTab('audit')} 
+                className={`px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${currentTab === 'audit' ? 'bg-[#e11d48] text-white shadow-lg' : 'text-slate-500 hover:text-white'}`}
+              >
+                <Zap size={14} /> Auditoría
+              </button>
+           </div>
+
+          <label className="bg-[#e11d48] hover:bg-[#be123c] text-white px-8 py-2.5 rounded-full text-xs font-black cursor-pointer transition-all shadow-lg flex items-center gap-2">
+            <Database size={14} /> CARGAR NAVISION
+            <input type="file" multiple className="hidden" onChange={handleFileUpload} accept=".xlsx,.xls" />
+          </label>
+        </div>
+      </header>
+
+      {projectList.length === 0 ? (
+        <div className="flex-1 flex flex-col items-center justify-center p-20 text-center opacity-40">
+          <Layers size={80} className="mb-6 text-slate-200" />
+          <h2 className="text-2xl font-bold italic tracking-tight uppercase">Esperando Datos de Zitro Navision</h2>
+          <p className="text-sm max-w-sm mt-2">Arrastra los archivos de Ensamblado y Ventas para auditar la cadena de suministro.</p>
+        </div>
+      ) : (
+        <div className="flex flex-1 overflow-hidden">
+          
+          {/* Sidebar Filtrable (Siempre presente) */}
+          <aside className="w-80 bg-white border-r border-slate-100 flex flex-col shrink-0">
+            <div className="p-6 border-b border-slate-50 bg-[#fafafa]">
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Proyectos Activos</span>
+                {filterType && (
+                  <button onClick={() => setFilterType(null)} className="text-[9px] font-black text-[#e11d48] flex items-center gap-1 hover:underline">
+                    <FilterX size={10} /> LIMPIAR
+                  </button>
+                )}
+              </div>
+              <div className="relative">
+                <Search className="absolute left-3 top-2.5 text-slate-300" size={14} />
+                <input 
+                  type="text" 
+                  placeholder="Buscar por FAB..." 
+                  className="w-full bg-white border border-slate-200 rounded-xl pl-10 pr-4 py-2.5 text-xs outline-none focus:ring-2 focus:ring-[#e11d48] shadow-sm"
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-1.5 bg-slate-50/20">
+              {filteredProjects.length === 0 ? (
+                <div className="p-10 text-center text-slate-300 text-[10px] font-bold italic">No hay proyectos con este criterio</div>
+              ) : (
+                filteredProjects.map(p => (
+                  <button
+                    key={p.id}
+                    onClick={() => { setActiveProject(p); setCurrentTab('audit'); }}
+                    className={`w-full text-left p-5 rounded-2xl transition-all border ${activeProject?.id === p.id ? 'bg-[#e11d48] text-white shadow-xl scale-[1.02]' : 'bg-white border-slate-100 text-slate-500 hover:border-rose-100 hover:bg-rose-50/30'}`}
+                  >
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="font-black text-xs">{p.id}</span>
+                      <div className="flex gap-1.5">
+                        {p.stats.locked > 0 && <Lock size={12} className={activeProject?.id === p.id ? 'text-white' : 'text-amber-500'} />}
+                        {p.stats.broken > 0 && <XCircle size={12} className={activeProject?.id === p.id ? 'text-white' : 'text-rose-500'} />}
+                      </div>
+                    </div>
+                    <p className={`text-[9px] font-bold truncate uppercase tracking-tighter ${activeProject?.id === p.id ? 'text-rose-100' : 'text-slate-400'}`}>{p.client || 'Zitro General'}</p>
+                  </button>
+                ))
+              )}
+            </div>
+          </aside>
+
+          {/* Main Area con Pestañas */}
+          <main className="flex-1 overflow-y-auto bg-[#f8fafc] custom-scrollbar">
+            
+            {/* VISTA 1: DASHBOARD */}
+            {currentTab === 'dashboard' && (
+              <div className="p-10 max-w-6xl mx-auto space-y-10 animate-in fade-in duration-500">
+                <div className="flex justify-between items-end">
+                    <div>
+                        <h2 className="text-4xl font-black text-slate-900 tracking-tighter uppercase italic">Estado <span className="text-[#e11d48]">General</span></h2>
+                        <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-1">Auditando {projectList.length} proyectos vinculados</p>
+                    </div>
+                </div>
+
+                <section className="bg-white rounded-[3.5rem] p-12 shadow-sm border border-slate-100">
+                    <div className="flex flex-col lg:flex-row items-center gap-16">
+                        <div className="w-full lg:w-1/2 h-80 flex flex-col items-center">
+                            <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.3em] mb-6">Haz clic en un segmento para filtrar la lista</h3>
+                            <ResponsiveContainer width="100%" height="100%">
+                                <PieChart onClick={handleChartClick}>
+                                    <Pie 
+                                        data={chartData} 
+                                        innerRadius={90} 
+                                        outerRadius={130} 
+                                        paddingAngle={6} 
+                                        dataKey="value"
+                                        stroke="none"
+                                        className="cursor-pointer"
+                                    >
+                                        {chartData.map((e, idx) => (
+                                            <Cell 
+                                                key={idx} 
+                                                fill={e.fill} 
+                                                opacity={filterType && filterType !== e.id ? 0.3 : 1}
+                                                className="transition-all duration-300 outline-none"
+                                            />
+                                        ))}
+                                    </Pie>
+                                    <RechartsTooltip 
+                                        contentStyle={{ borderRadius: '24px', border: 'none', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)', padding: '15px' }} 
+                                    />
+                                </PieChart>
+                            </ResponsiveContainer>
+                        </div>
+
+                        <div className="w-full lg:w-1/2 grid grid-cols-1 gap-3">
+                            {chartData.map(d => (
+                                <button 
+                                    key={d.id}
+                                    onClick={() => setFilterType(prev => prev === d.id ? null : d.id)}
+                                    className={`flex items-center justify-between p-6 rounded-3xl border-2 transition-all group ${filterType === d.id ? 'bg-slate-900 border-slate-900 text-white shadow-2xl scale-[1.03]' : 'bg-slate-50 border-transparent hover:border-slate-200'}`}
+                                >
+                                    <div className="flex items-center gap-5">
+                                        <div className="w-5 h-5 rounded-full shadow-inner ring-4 ring-white/10" style={{ backgroundColor: d.fill }}></div>
+                                        <div className="text-left">
+                                            <p className={`text-[11px] font-black uppercase tracking-wider ${filterType === d.id ? 'text-white' : 'text-slate-600'}`}>{d.name}</p>
+                                            <p className={`text-[9px] font-bold opacity-50 uppercase`}>{d.desc}</p>
+                                        </div>
+                                    </div>
+                                    <span className={`text-2xl font-black ${filterType === d.id ? 'text-[#e11d48]' : 'text-slate-900'}`}>{d.value}</span>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                </section>
+
+                {/* KPI Quick Cards */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm flex items-center gap-6">
+                        <div className="w-14 h-14 bg-emerald-50 text-emerald-600 rounded-2xl flex items-center justify-center"><FileCheck size={28}/></div>
+                        <div><p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Sincro Exitosa</p><p className="text-3xl font-black">{chartData[0].value}</p></div>
+                    </div>
+                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm flex items-center gap-6">
+                        <div className="w-14 h-14 bg-rose-50 text-rose-600 rounded-2xl flex items-center justify-center"><AlertCircle size={28}/></div>
+                        <div><p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Alertas de Ruptura</p><p className="text-3xl font-black">{chartData[3].value}</p></div>
+                    </div>
+                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm flex items-center gap-6">
+                        <div className="w-14 h-14 bg-amber-50 text-amber-600 rounded-2xl flex items-center justify-center"><Lock size={28}/></div>
+                        <div><p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Pedidos Bloqueados</p><p className="text-3xl font-black">{chartData[2].value}</p></div>
+                    </div>
+                </div>
+              </div>
+            )}
+
+            {/* VISTA 2: AUDITORÍA DETALLADA */}
+            {currentTab === 'audit' && (
+              <div className="p-10 max-w-6xl mx-auto animate-in slide-in-from-right-10 duration-500 pb-20">
+                {!activeProject ? (
+                  <div className="h-96 flex flex-col items-center justify-center text-center opacity-30 border-4 border-dashed border-slate-200 rounded-[4rem]">
+                    <ClipboardList size={64} className="mb-4 text-slate-300" />
+                    <h3 className="text-xl font-bold uppercase tracking-widest">Selecciona un proyecto de la lista</h3>
+                    <p className="text-sm font-medium mt-1">Para visualizar su cadena de trazabilidad y fechas</p>
+                  </div>
+                ) : (
+                  <div className="space-y-12">
+                    {/* Detalle Header */}
+                    <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6 border-b border-slate-200 pb-10">
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-4">
+                          <h2 className="text-6xl font-black text-slate-950 tracking-tighter italic uppercase">{activeProject.id}</h2>
+                          <div className={`px-4 py-1.5 rounded-full flex items-center gap-2 border text-[10px] font-black uppercase ${activeProject.stats.broken === 0 && activeProject.stats.locked === 0 ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : 'bg-rose-50 text-rose-600 border-rose-100 animate-pulse'}`}>
+                             {activeProject.stats.broken === 0 && activeProject.stats.locked === 0 ? <Check size={12}/> : <AlertOctagon size={12}/>}
+                             {activeProject.stats.broken === 0 && activeProject.stats.locked === 0 ? 'Flujo de Producción Óptimo' : 'Requiere Revisión Técnica'}
+                          </div>
+                        </div>
+                        <p className="text-slate-400 font-bold ml-1 uppercase text-xs tracking-widest italic flex items-center gap-2">
+                           <Layers size={14} /> Cliente: <span className="text-slate-900 font-black">{activeProject.client || 'General Zitro'}</span>
+                        </p>
+                      </div>
+
+                      {/* FECHA DE ENVÍO DESTACADA */}
+                      <div className="bg-slate-950 text-white p-8 rounded-[2.5rem] flex items-center gap-10 shadow-2xl relative overflow-hidden group">
+                        <div className="absolute top-0 right-0 w-32 h-32 bg-[#e11d48]/10 rounded-full blur-3xl group-hover:bg-[#e11d48]/20 transition-all"></div>
+                        <div className="text-right relative z-10">
+                          <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Fecha Envío de Venta (PV)</p>
+                          <p className="text-3xl font-black text-[#e11d48] drop-shadow-[0_0_10px_rgba(225,29,72,0.3)]">
+                            {activeProject.shipDate ? activeProject.shipDate.toLocaleDateString() : 'SIN FECHA'}
+                          </p>
+                        </div>
+                        <div className="w-14 h-14 rounded-2xl flex items-center justify-center bg-white/5 border border-white/10 text-[#e11d48] relative z-10 shadow-inner">
+                            <Truck size={28} />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* CADENA DE AUDITORÍA VISUAL */}
+                    <div className="bg-white rounded-[4rem] p-16 card-shadow border border-slate-100 flex flex-col items-center">
+                        <div className="w-full flex justify-between mb-10 px-4">
+                            <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.4em] flex items-center gap-2">
+                                <Activity size={14} className="text-[#e11d48]"/> Cronograma de Fases
+                            </h4>
+                            <span className="text-[10px] font-bold text-slate-300 uppercase">Orden Cronológico</span>
+                        </div>
+
+                        {activeProject.items.sort((a,b) => (a.end || 0) - (b.end || 0)).map((item, idx) => (
+                        <div key={item.id} className="w-full flex flex-col items-center group">
+                            
+                            <div className={`relative w-full max-w-4xl p-10 rounded-[3rem] border-2 flex items-center justify-between transition-all hover:-translate-y-1 ${
+                            item.status === 'final' ? 'border-emerald-500 bg-emerald-50/40 shadow-lg shadow-emerald-100' : 
+                            item.status === 'correlative' ? 'border-emerald-200 bg-emerald-50/10' : 
+                            item.status === 'locked' ? 'border-amber-400 bg-amber-50/20 shadow-lg shadow-amber-50' : 'border-rose-200 bg-rose-50/20'
+                            }`}>
+                            
+                            <div className="flex items-center gap-10 text-left">
+                                <div className={`w-16 h-16 rounded-[1.5rem] flex items-center justify-center shadow-xl transition-transform group-hover:scale-110 ${
+                                item.status === 'final' ? 'bg-emerald-600 text-white shadow-emerald-200' : 
+                                item.status === 'correlative' ? 'bg-[#A7F3D0] text-emerald-700' : 
+                                item.status === 'locked' ? 'bg-amber-500 text-white shadow-amber-200' : 'bg-[#e11d48] text-white shadow-rose-200'
+                                }`}>
+                                {item.status === 'final' ? <Check size={36} strokeWidth={4} /> : 
+                                    item.status === 'correlative' ? <LinkIcon size={28} strokeWidth={3} /> : 
+                                    item.status === 'locked' ? <Lock size={28} /> : <XCircle size={36} />}
+                                </div>
+                                
+                                <div>
+                                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-none mb-2">{item.id}</p>
+                                <h4 className="font-extrabold text-slate-900 text-xl leading-tight">{item.desc}</h4>
+                                {item.status === 'locked' && (
+                                    <div className="flex items-center gap-2 mt-3 bg-amber-100/50 w-fit px-3 py-1 rounded-lg border border-amber-200/50">
+                                        <AlertCircle size={10} className="text-amber-600" />
+                                        <span className="text-[9px] font-black uppercase text-amber-700">BLOQUEADO: Desfase mayor a 10 días</span>
+                                    </div>
+                                )}
+                                </div>
+                            </div>
+
+                            <div className="flex gap-16 text-right pr-6">
+                                <div className="space-y-1">
+                                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Inicio Fase</p>
+                                <p className="text-base font-black text-slate-600">{item.start ? item.start.toLocaleDateString() : '-'}</p>
+                                </div>
+                                <div className="space-y-1">
+                                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Vencimiento</p>
+                                <p className={`text-base font-black ${item.status === 'final' ? 'text-emerald-700' : item.status === 'broken' ? 'text-[#e11d48]' : 'text-slate-950'}`}>
+                                    {item.end ? item.end.toLocaleDateString() : '-'}
+                                </p>
+                                </div>
+                            </div>
+                            </div>
+
+                            {idx < activeProject.items.length - 1 && (
+                            <div className="flex flex-col items-center my-3">
+                                <div className={`w-1.5 h-10 rounded-full ${
+                                    ['correlative','final'].includes(activeProject.items[idx+1].status) ? 'bg-emerald-200' : 'bg-slate-100'
+                                }`}></div>
+                            </div>
+                            )}
+                        </div>
+                        ))}
+                    </div>
+
+                    {/* Leyenda de Casuísticas */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mt-10">
+                        <div className="bg-emerald-600 text-white p-6 rounded-3xl shadow-xl flex items-center gap-4 transition-all hover:scale-105">
+                            <Check size={24} className="opacity-50" />
+                            <div><p className="text-[9px] font-black uppercase opacity-60">Sincro Final</p><p className="text-xs font-bold leading-tight">Coincide con Envío PV</p></div>
+                        </div>
+                        <div className="bg-emerald-200 text-emerald-900 p-6 rounded-3xl shadow-lg flex items-center gap-4 border border-emerald-300 transition-all hover:scale-105">
+                            <LinkIcon size={24} className="opacity-50" />
+                            <div><p className="text-[9px] font-black uppercase opacity-60">Correlativo</p><p className="text-xs font-bold leading-tight">Secuencia Técnica OK</p></div>
+                        </div>
+                        <div className="bg-amber-500 text-white p-6 rounded-3xl shadow-xl flex items-center gap-4 transition-all hover:scale-105">
+                            <Lock size={24} className="opacity-50" />
+                            <div><p className="text-[9px] font-black uppercase opacity-60">Bloqueado</p><p className="text-xs font-bold leading-tight">Envío {'>'} 10d anterior</p></div>
+                        </div>
+                        <div className="bg-[#e11d48] text-white p-6 rounded-3xl shadow-xl flex items-center gap-4 transition-all hover:scale-105">
+                            <XCircle size={24} className="opacity-50" />
+                            <div><p className="text-[9px] font-black uppercase opacity-60">Cadena Rota</p><p className="text-xs font-bold leading-tight">Sin Conexión Lógica</p></div>
+                        </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+          </main>
+        </div>
+      )}
+      
+      {/* Footer Tecnico */}
+      <footer className="bg-white border-t border-slate-100 py-3 px-8 flex justify-between items-center text-[10px] font-black text-slate-300 uppercase tracking-widest shrink-0">
+        <div className="flex gap-6 items-center">
+           {filesLoaded.length > 0 ? (
+             filesLoaded.map((f, i) => (
+                <span key={i} className="flex items-center gap-2 text-emerald-500"> 
+                    <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></div> {f} CARGADO
+                </span>
+             ))
+           ) : (
+             <span className="text-slate-400 italic">SISTEMA OFFLINE - ESPERANDO CARGA EXCEL</span>
+           )}
+        </div>
+        <div className="flex items-center gap-2">
+            <Layers size={12} className="text-slate-400"/>
+            <p>Zitro Games | Planning Intelligence Unit 2024</p>
+        </div>
+      </footer>
+
+    </div>
+  );
+};
+
+export default App;
